@@ -8,6 +8,7 @@
 from flask import Flask, request, redirect, url_for, session, send_file, render_template_string, flash, get_flashed_messages
 import os
 import sqlite3
+import shutil
 from pathlib import Path
 from datetime import datetime, date
 import webbrowser
@@ -19,15 +20,21 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 APP_NAME = "QHSE Manager Pro - Chemical Register"
-VERSION = "v2.3 ALIAS MODIFIABLES / SUPPRIMABLES"
+VERSION = "v2.5 SAUVEGARDE + RESTAURATION"
 COPYRIGHT = "Copyright © 2026 Kodjotse Eli ADIGBLI. Tous droits réservés."
 
 BASE_DIR = Path(__file__).parent
-DB_PATH = BASE_DIR / "qhse_chemical_register.db"
-EXPORT_DIR = BASE_DIR / "exports"
-UPLOAD_DIR = BASE_DIR / "uploads"
-EXPORT_DIR.mkdir(exist_ok=True)
-UPLOAD_DIR.mkdir(exist_ok=True)
+# Sur Render Starter, DATA_DIR doit pointer vers le disque persistant monté sur /var/data.
+# En local, l'application continue d'utiliser le dossier du projet.
+DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "qhse_chemical_register.db"
+EXPORT_DIR = DATA_DIR / "exports"
+UPLOAD_DIR = DATA_DIR / "uploads"
+BACKUP_DIR = DATA_DIR / "backups"
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "qhse_manager_pro_change_this_key")
@@ -45,6 +52,11 @@ def add_security_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     return response
+
+@app.before_request
+def run_automatic_backup_check():
+    if logged() and can_access_admin_features():
+        automatic_daily_backup()
 
 CSS = """
 <style>
@@ -68,7 +80,12 @@ button,.btn{background:var(--main);color:white;padding:9px 14px;border:0;border-
 .flash{background:#fff2cc;padding:10px;border:1px solid #e0c36c;margin-bottom:12px;border-radius:6px}
 .help{background:#eef7ff;border:1px solid #bed7ee;padding:12px;border-radius:8px;margin-bottom:14px}
 .badge{display:inline-block;padding:3px 8px;border-radius:12px;background:#eef3f7;font-size:12px}
-@media(max-width:900px){.grid,.row,.row3{grid-template-columns:1fr}nav a{display:inline-block;margin-bottom:8px}}
+.login-wrap{min-height:calc(100vh - 170px);display:flex;align-items:center;justify-content:center;padding:24px}
+.login-card{width:100%;max-width:480px;background:white;border:1px solid var(--border);border-radius:12px;padding:24px;box-shadow:0 10px 28px rgba(31,51,71,.14)}
+.login-card h2{text-align:center;margin-top:0;color:var(--main)}
+.login-card button,.btn-full{width:100%;font-weight:bold}
+.login-subtitle{text-align:center;color:#666;font-size:13px;margin-top:-8px;margin-bottom:18px}
+@media(max-width:900px){.grid,.row,.row3{grid-template-columns:1fr}nav a{display:inline-block;margin-bottom:8px}.login-wrap{min-height:auto;padding:12px}}
 </style>
 """
 
@@ -77,6 +94,66 @@ def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def create_db_backup(reason="manual"):
+    """Crée une copie sûre de la base SQLite sans interrompre l'application."""
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+        return None
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_reason = "".join(ch for ch in reason.lower().replace(" ", "_") if ch.isalnum() or ch in ["_", "-"])[:40] or "backup"
+    backup_path = BACKUP_DIR / f"qhse_chemical_register_{safe_reason}_{timestamp}.db"
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(backup_path)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    return backup_path
+
+def backup_before_sensitive_operation(reason):
+    try:
+        path = create_db_backup(reason)
+        if path:
+            log_action("Sauvegarde automatique", path.name)
+        return path
+    except Exception as exc:
+        print("Backup warning:", exc)
+        return None
+
+def latest_backup_file():
+    backups = sorted(BACKUP_DIR.glob("qhse_chemical_register_*.db"), key=lambda x: x.stat().st_mtime, reverse=True)
+    return backups[0] if backups else None
+
+def automatic_daily_backup():
+    """Sauvegarde automatique quotidienne au premier accès de la journée."""
+    try:
+        today_marker = BACKUP_DIR / f"auto_done_{date.today().isoformat()}.txt"
+        if not today_marker.exists() and DB_PATH.exists() and DB_PATH.stat().st_size > 0:
+            path = create_db_backup("auto_journalier")
+            today_marker.write_text(path.name if path else "no_db", encoding="utf-8")
+            if path:
+                log_action("Sauvegarde automatique journalière", path.name)
+    except Exception as exc:
+        print("Daily backup warning:", exc)
+
+def protect_database_on_startup():
+    """Protection au démarrage : sauvegarde préventive de la base existante."""
+    try:
+        marker = BACKUP_DIR / f"startup_done_{date.today().isoformat()}.txt"
+        if DB_PATH.exists() and DB_PATH.stat().st_size > 0 and not marker.exists():
+            path = create_db_backup("avant_demarrage")
+            marker.write_text(path.name if path else "no_db", encoding="utf-8")
+    except Exception as exc:
+        print("Startup backup warning:", exc)
+
+def validate_backup_filename(filename):
+    name = os.path.basename(filename or "")
+    path = BACKUP_DIR / name
+    if not name.startswith("qhse_chemical_register_") or path.suffix != ".db" or not path.exists():
+        return None
+    return path
 
 def ensure_column(conn, table, col, definition):
     cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -181,6 +258,19 @@ def init_db():
         username TEXT,
         action TEXT,
         details TEXT
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS workforce(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_date TEXT NOT NULL,
+        project_id INTEGER,
+        subcontractor_id INTEGER NOT NULL,
+        men INTEGER DEFAULT 0,
+        women INTEGER DEFAULT 0,
+        total INTEGER DEFAULT 0,
+        observations TEXT,
+        created_by TEXT,
+        created_at TEXT
     )""")
 
     cur.execute("UPDATE users SET role='super_admin' WHERE role='admin'")
@@ -336,6 +426,15 @@ def where_scope(prefix="e"):
         return f" WHERE {prefix}.subcontractor_id=? ", [current_subcontractor_id()]
     return " WHERE 1=0 ", []
 
+def workforce_scope(prefix="w"):
+    if is_super_admin():
+        return "", []
+    if is_project_admin() or is_reader():
+        return f" WHERE {prefix}.project_id=? ", [current_project_id()]
+    if is_subcontractor():
+        return f" WHERE {prefix}.subcontractor_id=? ", [current_subcontractor_id()]
+    return " WHERE 1=0 ", []
+
 def scoped_and_clause():
     where, params = where_scope("e")
     return (where + (" AND " if where else " WHERE "), params)
@@ -398,6 +497,7 @@ def layout(title, body):
             <a href="{url_for('consolidation')}">Consolidation</a>
             <a href="{url_for('export_excel')}">Export Excel</a>
             <a href="{url_for('audit_trail')}">Journal</a>
+            <a href="{url_for('backups')}">Sauvegardes</a>
             """
         if is_reader():
             admin_links = f"""<a href="{url_for('consolidation')}">Consolidation</a><a href="{url_for('alerts')}">Alertes</a>"""
@@ -405,7 +505,8 @@ def layout(title, body):
         <nav>
             <a href="{url_for('dashboard')}">Tableau de bord</a>
             {admin_links}
-            <a href="{url_for('entries')}">Saisie</a>
+            <a href="{url_for('entries')}">Saisie produits</a>
+            <a href="{url_for('workforce')}">Effectifs</a>
             <a href="{url_for('about')}">À propos</a>
             <a href="{url_for('logout')}">Déconnexion</a>
         </nav>"""
@@ -481,10 +582,12 @@ def login():
             log_action("Connexion", "Connexion utilisateur")
             return redirect(url_for("dashboard"))
         flash("Identifiants incorrects ou compte inactif.")
-    return layout("Connexion", """<h2>Connexion</h2><div class="box"><form method="post" autocomplete="off">
+    return layout("Connexion", """<div class="login-wrap"><div class="login-card">
+        <h2>Connexion</h2><div class="login-subtitle">Accès sécurisé au registre QHSE</div>
+        <form method="post" autocomplete="off">
         <label>Utilisateur</label><input name="username" autocomplete="off" required autofocus placeholder="Saisir votre identifiant">
         <label>Mot de passe</label><input name="password" type="password" autocomplete="new-password" required placeholder="Saisir votre mot de passe">
-        <button>Se connecter</button></form></div>""")
+        <button>Se connecter</button></form></div></div>""")
 
 @app.route("/logout")
 def logout():
@@ -558,6 +661,18 @@ def dashboard():
                           {where}
                           GROUP BY e.month ORDER BY e.month DESC LIMIT 6""", params).fetchall()
 
+    w_where, w_params = workforce_scope("w")
+    today = date.today().strftime("%Y-%m-%d")
+    w_and = (w_where + " AND ") if w_where else " WHERE "
+    workforce_today = conn.execute(f"SELECT COALESCE(SUM(total),0) s FROM workforce w {w_and} w.work_date=?", w_params + [today]).fetchone()["s"]
+    workforce_week = conn.execute(f"SELECT COALESCE(SUM(total),0) s FROM workforce w {w_and} strftime('%Y-%W', w.work_date)=strftime('%Y-%W','now')", w_params).fetchone()["s"]
+    workforce_month = conn.execute(f"SELECT COALESCE(SUM(total),0) s FROM workforce w {w_and} substr(w.work_date,1,7)=strftime('%Y-%m','now')", w_params).fetchone()["s"]
+    workforce_year = conn.execute(f"SELECT COALESCE(SUM(total),0) s FROM workforce w {w_and} substr(w.work_date,1,4)=strftime('%Y','now')", w_params).fetchone()["s"]
+    workforce_by_st = conn.execute(f"""SELECT s.name st, COALESCE(SUM(w.total),0) total
+                          FROM workforce w JOIN subcontractors s ON s.id=w.subcontractor_id
+                          {w_where}
+                          GROUP BY s.name ORDER BY total DESC LIMIT 10""", w_params).fetchall()
+
     conn.close()
 
     top_products_rows = "".join([f"<tr><td>{r['product']}</td><td>{r['stock']}</td></tr>" for r in top_products]) or "<tr><td colspan='2'>Aucune donnée</td></tr>"
@@ -565,6 +680,7 @@ def dashboard():
     st_rows = "".join([f"<tr><td>{r['st']}</td><td>{r['products_count']}</td><td>{r['stock']}</td></tr>" for r in by_subcontractor]) or "<tr><td colspan='3'>Aucune donnée</td></tr>"
     family_rows = "".join([f"<tr><td>{r['family']}</td><td>{r['count_products']}</td><td>{r['stock']}</td></tr>" for r in by_family]) or "<tr><td colspan='3'>Aucune donnée</td></tr>"
     month_rows = "".join([f"<tr><td>{r['month']}</td><td>{r['qty_in']}</td><td>{r['qty_used']}</td><td>{r['stock']}</td></tr>" for r in by_month]) or "<tr><td colspan='4'>Aucune donnée</td></tr>"
+    workforce_st_rows = "".join([f"<tr><td>{r['st']}</td><td>{r['total']}</td></tr>" for r in workforce_by_st]) or "<tr><td colspan='2'>Aucune donnée</td></tr>"
 
     return layout("Tableau de bord", f"""
     <h2>Tableau de bord</h2><div class="help">{help_text}</div>
@@ -584,7 +700,13 @@ def dashboard():
         <div class="card">Alertes QHSE<div class="value warn">{alerts_count}</div></div>
         <div class="card">Alertes critiques<div class="value danger">{critical_alerts}</div></div>
         <div class="card">Alertes attention<div class="value warn">{warning_alerts}</div></div>
-        <div class="card">Version<div class="value ok">2.1</div></div>
+        <div class="card">Version<div class="value ok">2.4</div></div>
+    </div><br>
+    <div class="grid">
+        <div class="card">Effectif aujourd'hui<div class="value ok">{workforce_today}</div></div>
+        <div class="card">Effectif semaine<div class="value ok">{workforce_week}</div></div>
+        <div class="card">Effectif mois<div class="value ok">{workforce_month}</div></div>
+        <div class="card">Effectif année<div class="value ok">{workforce_year}</div></div>
     </div>
 
     <h3>Analyse rapide</h3>
@@ -603,6 +725,8 @@ def dashboard():
         <div>
             <h3>Stock par sous-traitant</h3>
             <table><tr><th>Sous-traitant</th><th>Nb produits</th><th>Stock</th></tr>{st_rows}</table>
+            <h3>Effectifs par sous-traitant</h3>
+            <table><tr><th>Sous-traitant</th><th>Total période courante</th></tr>{workforce_st_rows}</table>
         </div>
         <div>
             <h3>Répartition par famille</h3>
@@ -1120,6 +1244,118 @@ def delete_entry(entry_id):
     flash("Saisie supprimée.")
     return redirect(url_for("entries"))
 
+@app.route("/workforce", methods=["GET","POST"])
+def workforce():
+    if not logged(): return redirect(url_for("login"))
+    conn = db()
+    if request.method == "POST":
+        work_date = request.form.get("work_date") or date.today().strftime("%Y-%m-%d")
+        project_id = request.form.get("project_id") or None
+        subcontractor_id = request.form.get("subcontractor_id") or None
+        men = safe_int(request.form.get("men"), 0)
+        women = safe_int(request.form.get("women"), 0)
+        total = men + women
+        if is_project_admin(): project_id = current_project_id()
+        if is_subcontractor(): subcontractor_id = current_subcontractor_id()
+        if is_reader():
+            flash("Compte en lecture seule : saisie non autorisée."); conn.close(); return redirect(url_for("workforce"))
+        if not subcontractor_id:
+            flash("Choisis le sous-traitant."); conn.close(); return redirect(url_for("workforce"))
+        if not project_id:
+            flash("Choisis le projet/site."); conn.close(); return redirect(url_for("workforce"))
+        conn.execute("""INSERT INTO workforce(work_date,project_id,subcontractor_id,men,women,total,observations,created_by,created_at)
+                        VALUES(?,?,?,?,?,?,?,?,?)""", (work_date, project_id, subcontractor_id, men, women, total, request.form.get("observations",""), session.get("username",""), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit(); log_action("Saisie effectif", f"{work_date} - ST {subcontractor_id} - total {total}"); flash("Effectif enregistré.")
+
+    if is_super_admin():
+        projects = conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
+    else:
+        projects = conn.execute("SELECT * FROM projects WHERE id=?", (current_project_id(),)).fetchall() if current_project_id() else conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
+    if is_subcontractor():
+        sts = conn.execute("SELECT * FROM subcontractors WHERE id=?", (current_subcontractor_id(),)).fetchall()
+    else:
+        sts = conn.execute("SELECT * FROM subcontractors ORDER BY name").fetchall()
+
+    start_date = request.args.get("start_date", "")
+    end_date = request.args.get("end_date", "")
+    clauses=[]; params=[]
+    if start_date: clauses.append("w.work_date>=?"); params.append(start_date)
+    if end_date: clauses.append("w.work_date<=?"); params.append(end_date)
+    scope_where, scope_params = workforce_scope("w")
+    if scope_where:
+        clauses.append(scope_where.replace(" WHERE ","").strip())
+        params += scope_params
+    where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
+
+    rows = conn.execute(f"""SELECT w.*, p.name project_name, s.name st_name
+        FROM workforce w LEFT JOIN projects p ON p.id=w.project_id JOIN subcontractors s ON s.id=w.subcontractor_id
+        {where_sql} ORDER BY w.work_date DESC, p.name, s.name LIMIT 400""", params).fetchall()
+    summary_day = conn.execute(f"""SELECT w.work_date, COALESCE(p.name,'') project_name, SUM(w.total) total
+        FROM workforce w LEFT JOIN projects p ON p.id=w.project_id {where_sql}
+        GROUP BY w.work_date, project_name ORDER BY w.work_date DESC LIMIT 60""", params).fetchall()
+    conn.close()
+
+    project_opts = "".join([f"<option value='{p['id']}'>{p['name']}</option>" for p in projects])
+    st_opts = "".join([f"<option value='{st['id']}'>{st['name']}</option>" for st in sts])
+    add_form = "" if is_reader() else f"""<div class="box"><form method="post">
+        <div class="row3"><div><label>Date</label><input type="date" name="work_date" value="{date.today().strftime('%Y-%m-%d')}" required></div><div><label>Projet / Site</label><select name="project_id">{project_opts}</select></div><div><label>Sous-traitant</label><select name="subcontractor_id">{st_opts}</select></div></div>
+        <div class="row3"><div><label>Hommes</label><input type="number" min="0" name="men" value="0"></div><div><label>Femmes</label><input type="number" min="0" name="women" value="0"></div><div><label>Observations</label><input name="observations" placeholder="RAS, activité particulière, remarque HSE..."></div></div>
+        <button>Enregistrer l'effectif</button></form></div>"""
+    export_btn = f"<a class='btn' href='{url_for('export_workforce_excel')}'>Exporter les effectifs en Excel</a>" if can_access_admin_features() else ""
+    trs = "".join([f"<tr><td>{r['work_date']}</td><td>{r['project_name'] or ''}</td><td>{r['st_name']}</td><td>{r['men']}</td><td>{r['women']}</td><td><strong>{r['total']}</strong></td><td>{r['observations'] or ''}</td></tr>" for r in rows]) or "<tr><td colspan='7'>Aucune donnée</td></tr>"
+    sum_rows = "".join([f"<tr><td>{r['work_date']}</td><td>{r['project_name']}</td><td><strong>{r['total']}</strong></td></tr>" for r in summary_day]) or "<tr><td colspan='3'>Aucune donnée</td></tr>"
+    return layout("Effectifs", f"""<h2>Effectifs journaliers sous-traitants</h2>
+    <div class="help">Chaque sous-traitant voit ses propres effectifs. Les admins voient les données selon leurs projets autorisés. Les totaux se compilent automatiquement par jour, semaine, mois et année dans le tableau de bord.</div>
+    {export_btn}<br><br>{add_form}
+    <div class="box"><form method="get"><div class="row"><div><label>Date début</label><input type="date" name="start_date" value="{start_date}"></div><div><label>Date fin</label><input type="date" name="end_date" value="{end_date}"></div></div><button>Filtrer</button></form></div>
+    <h3>Saisies détaillées</h3><table><tr><th>Date</th><th>Projet/Site</th><th>Sous-traitant</th><th>Hommes</th><th>Femmes</th><th>Total</th><th>Observations</th></tr>{trs}</table>
+    <h3>Total journalier par site</h3><table><tr><th>Date</th><th>Site</th><th>Total</th></tr>{sum_rows}</table>""")
+
+@app.route("/export_workforce_excel", methods=["GET"])
+def export_workforce_excel():
+    if not logged() or not can_access_admin_features(): return redirect(url_for("dashboard"))
+    conn = db()
+    start_date = request.args.get("start_date", "")
+    end_date = request.args.get("end_date", "")
+    clauses=[]; params=[]
+    if start_date: clauses.append("w.work_date>=?"); params.append(start_date)
+    if end_date: clauses.append("w.work_date<=?"); params.append(end_date)
+    scope_where, scope_params = workforce_scope("w")
+    if scope_where:
+        clauses.append(scope_where.replace(" WHERE ","").strip()); params += scope_params
+    where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = conn.execute(f"""SELECT w.*, p.name project_name, s.name st_name
+        FROM workforce w LEFT JOIN projects p ON p.id=w.project_id JOIN subcontractors s ON s.id=w.subcontractor_id
+        {where_sql} ORDER BY w.work_date, p.name, s.name""", params).fetchall()
+    by_day = conn.execute(f"""SELECT w.work_date, COALESCE(p.name,'') project_name, SUM(w.total) total
+        FROM workforce w LEFT JOIN projects p ON p.id=w.project_id {where_sql}
+        GROUP BY w.work_date, project_name ORDER BY w.work_date""", params).fetchall()
+    by_month = conn.execute(f"""SELECT substr(w.work_date,1,7) month, COALESCE(p.name,'') project_name, SUM(w.total) total
+        FROM workforce w LEFT JOIN projects p ON p.id=w.project_id {where_sql}
+        GROUP BY month, project_name ORDER BY month""", params).fetchall()
+    by_year = conn.execute(f"""SELECT substr(w.work_date,1,4) year, COALESCE(p.name,'') project_name, SUM(w.total) total
+        FROM workforce w LEFT JOIN projects p ON p.id=w.project_id {where_sql}
+        GROUP BY year, project_name ORDER BY year""", params).fetchall()
+    conn.close()
+    wb=Workbook(); ws=wb.active; ws.title="Détails effectifs"
+    ws.append(["Date","Projet/Site","Sous-traitant","Hommes","Femmes","Total","Observations","Saisi par","Date saisie"])
+    for r in rows: ws.append([r['work_date'],r['project_name'],r['st_name'],r['men'],r['women'],r['total'],r['observations'],r['created_by'],r['created_at']])
+    ws2=wb.create_sheet("Totaux journaliers"); ws2.append(["Date","Site","Total"])
+    for r in by_day: ws2.append([r['work_date'],r['project_name'],r['total']])
+    ws3=wb.create_sheet("Totaux mensuels"); ws3.append(["Mois","Site","Total"])
+    for r in by_month: ws3.append([r['month'],r['project_name'],r['total']])
+    ws4=wb.create_sheet("Totaux annuels"); ws4.append(["Année","Site","Total"])
+    for r in by_year: ws4.append([r['year'],r['project_name'],r['total']])
+    fill = PatternFill("solid", fgColor="1F3347")
+    for sheet in wb.worksheets:
+        for cell in sheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF"); cell.fill = fill; cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for col in sheet.columns:
+            sheet.column_dimensions[get_column_letter(col[0].column)].width = min(max(len(str(c.value or "")) for c in col)+2, 45)
+    filename = EXPORT_DIR / f"Rapport_Effectifs_{start_date or 'debut'}_{end_date or 'fin'}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    wb.save(filename); log_action("Export Excel effectifs", filename.name)
+    return send_file(filename, as_attachment=True)
+
 @app.route("/alerts")
 def alerts():
     if not logged() or is_subcontractor(): return redirect(url_for("dashboard"))
@@ -1218,6 +1454,67 @@ def export_excel():
     wb.save(filename); log_action("Export Excel période", filename.name)
     return send_file(filename, as_attachment=True)
 
+
+@app.route("/backups", methods=["GET", "POST"])
+def backups():
+    if not logged() or not can_access_admin_features():
+        return redirect(url_for("dashboard"))
+    if not is_super_admin():
+        flash("Seul le super admin peut restaurer la base de données.")
+
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "create":
+            path = backup_before_sensitive_operation("manuel")
+            flash(f"Sauvegarde créée : {path.name}" if path else "Aucune base disponible à sauvegarder.")
+            return redirect(url_for("backups"))
+
+        if action == "restore":
+            if not is_super_admin():
+                return redirect(url_for("backups"))
+            backup_path = validate_backup_filename(request.form.get("filename"))
+            confirm = request.form.get("confirm") == "RESTAURER"
+            if not backup_path:
+                flash("Fichier de sauvegarde invalide.")
+                return redirect(url_for("backups"))
+            if not confirm:
+                flash("Pour restaurer, saisir exactement : RESTAURER")
+                return redirect(url_for("backups"))
+            before = backup_before_sensitive_operation("avant_restauration")
+            shutil.copy2(backup_path, DB_PATH)
+            log_action("Restauration base", f"Restauré depuis {backup_path.name}; sauvegarde avant restauration: {before.name if before else 'non créée'}")
+            flash("Base restaurée avec succès. Déconnecte-toi puis reconnecte-toi si nécessaire.")
+            return redirect(url_for("backups"))
+
+    files = []
+    for f in sorted(BACKUP_DIR.glob("qhse_chemical_register_*.db"), key=lambda x: x.stat().st_mtime, reverse=True):
+        files.append({
+            "name": f.name,
+            "date": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            "size": round(f.stat().st_size / 1024, 1)
+        })
+    rows = "".join([f"""<tr><td>{x['date']}</td><td>{x['name']}</td><td>{x['size']} Ko</td><td class='actions'>
+        <a class='btn mini' href='{url_for('download_backup', filename=x['name'])}'>Télécharger</a>
+        {"<form method='post' style='display:inline-block;margin-left:6px'><input type='hidden' name='action' value='restore'><input type='hidden' name='filename' value='" + x['name'] + "'><input name='confirm' placeholder='RESTAURER' style='width:120px;margin:0'><button class='mini btn-danger'>Restaurer</button></form>" if is_super_admin() else ""}
+        </td></tr>""" for x in files]) or "<tr><td colspan='4'>Aucune sauvegarde disponible.</td></tr>"
+    return layout("Sauvegardes", f"""<h2>Sauvegarde / restauration</h2>
+    <div class='help'><strong>Protection activée :</strong> sauvegarde automatique quotidienne, sauvegarde avant démarrage, et sauvegarde automatique avant toute restauration.</div>
+    <div class='box'>
+    <form method='post'><input type='hidden' name='action' value='create'><button>Créer une sauvegarde maintenant</button></form>
+    <p class='muted'>Les sauvegardes sont stockées dans le dossier <strong>backups</strong>. Pour éviter une perte totale, copie régulièrement ce dossier sur clé USB, disque externe ou cloud.</p>
+    </div>
+    <table><tr><th>Date</th><th>Fichier</th><th>Taille</th><th>Actions</th></tr>{rows}</table>""")
+
+@app.route("/backups/download/<filename>")
+def download_backup(filename):
+    if not logged() or not can_access_admin_features():
+        return redirect(url_for("dashboard"))
+    path = validate_backup_filename(filename)
+    if not path:
+        flash("Fichier de sauvegarde introuvable.")
+        return redirect(url_for("backups"))
+    return send_file(path, as_attachment=True)
+
 @app.route("/audit_trail")
 def audit_trail():
     if not logged() or not can_access_admin_features(): return redirect(url_for("dashboard"))
@@ -1244,11 +1541,13 @@ def open_browser():
 
 # Cloud initialization
 try:
+    protect_database_on_startup()
     init_db()
 except Exception as cloud_init_error:
     print("Database initialization warning:", cloud_init_error)
 
 if __name__ == "__main__":
+    protect_database_on_startup()
     init_db()
     cloud_mode = os.environ.get("CLOUD_MODE", "false").lower() == "true"
     port = int(os.environ.get("PORT", "5000"))

@@ -2,11 +2,18 @@ services:
   - type: web
     name: qhse-manager-pro
     env: python
-    plan: free
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app
+    healthCheckPath: /health
+    disk:
+      name: qhse-manager-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: CLOUD_MODE
         value: true
+      - key: DATA_DIR
+        value: /var/data
       - key: SECRET_KEY
         generateValue: true
