@@ -9,11 +9,13 @@ services:
     disk:
       name: qhse-manager-data
       mountPath: /var/data
-      sizeGB: 1
+      sizeGB: 5
     envVars:
       - key: CLOUD_MODE
         value: true
       - key: DATA_DIR
         value: /var/data
       - key: SECRET_KEY
+        generateValue: true
+      - key: TASK_TOKEN
         generateValue: true
